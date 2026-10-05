@@ -109,7 +109,13 @@ export class Http {
     limit = 2 * 1024 * 1024,
   ): Promise<Reply> {
     checkUrl(url, hosts);
-    const r = await this.transport(url, method, headers, body, limit);
+    let r: Reply;
+    try {
+      r = await this.transport(url, method, headers, body, limit);
+    } catch (e) {
+      if (e instanceof Fault) throw e;
+      throw new Fault("网络请求失败", 0, true);
+    }
     if (r.bytes.length > limit) throw new Fault("媒体或响应超过限额");
     if (r.status === 429) {
       const seconds = Number(r.headers.get("retry-after"));

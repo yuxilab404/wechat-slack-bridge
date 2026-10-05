@@ -47,6 +47,10 @@ async function setup(t: any) {
     calls.push({ path, body, bytes });
     const failure = failures.get(path);
     if (failure && failure.count-- > 0) {
+      if (failure.status === 0) {
+        req.socket.destroy();
+        return;
+      }
       res.writeHead(failure.status, { "Retry-After": "2" });
       res.end("{}");
       return;
@@ -609,4 +613,143 @@ test("Socket Mode 假服务发送正式事件封套，持久保存后 ACK 并回
   h.ready();
   await h.bridge.work();
   assert.equal(h.calls.filter((x) => x.path.endsWith("sendmessage")).length, 1);
+});
+
+for (const path of ["/api/files.getUploadURLExternal", "/upload/test"]) {
+  for (const status of [500, 0]) {
+    test(`图片发布前 ${path} ${status === 0 ? "断网" : "服务端错误"} 安全重试`, async (t) => {
+      const h = await setup(t);
+      h.failures.set(path, { status, count: 1 });
+      h.bridge.ingest(
+        batch(
+          message("1", [
+            {
+              type: 2,
+              image_item: {
+                media: {
+                  encrypt_query_param: "fixture",
+                  aes_key: key.toString("base64"),
+                },
+              },
+            },
+          ]),
+        ),
+      );
+      await h.bridge.work();
+      assert.equal(
+        h.store.get("SELECT status FROM jobs WHERE kind='slackImage'").status,
+        "pending",
+      );
+      assert.equal(
+        h.calls.filter((x) => x.path.endsWith("files.completeUploadExternal"))
+          .length,
+        0,
+      );
+      h.restart();
+      h.ready();
+      await h.bridge.work();
+      assert.equal(
+        h.store.get("SELECT status FROM jobs WHERE kind='slackImage'").status,
+        "done",
+      );
+      assert.equal(
+        h.calls.filter((x) => x.path.endsWith("files.completeUploadExternal"))
+          .length,
+        1,
+      );
+      assert.equal(
+        h.calls.filter((x) => x.path.endsWith("chat.postMessage")).length,
+        2,
+      );
+    });
+  }
+}
+
+test("图片完成发布接口结果不确定时仍禁止重试", async (t) => {
+  const h = await setup(t);
+  h.failures.set("/api/files.completeUploadExternal", {
+    status: 500,
+    count: 1,
+  });
+  h.bridge.ingest(
+    batch(
+      message("1", [
+        {
+          type: 2,
+          image_item: {
+            media: {
+              encrypt_query_param: "fixture",
+              aes_key: key.toString("base64"),
+            },
+          },
+        },
+      ]),
+    ),
+  );
+  await h.bridge.work();
+  h.restart();
+  h.ready();
+  await h.bridge.work();
+  assert.equal(
+    h.store.get("SELECT status FROM jobs WHERE kind='slackImage'").status,
+    "uncertain",
+  );
+  assert.equal(
+    h.calls.filter((x) => x.path.endsWith("files.completeUploadExternal"))
+      .length,
+    1,
+  );
+  assert.equal(
+    h.calls.filter((x) => x.path.endsWith("chat.postMessage")).length,
+    1,
+  );
+});
+
+test("超过 TTL 后重启先清理，根消息和图片不得发送", async (t) => {
+  const h = await setup(t);
+  h.bridge.ingest(
+    batch(
+      message("1", [
+        { type: 1, text_item: { text: "过期文字" } },
+        {
+          type: 2,
+          image_item: {
+            media: {
+              encrypt_query_param: "fixture",
+              aes_key: key.toString("base64"),
+            },
+          },
+        },
+      ]),
+    ),
+  );
+  h.store.run("UPDATE jobs SET created=0");
+  h.store.run("UPDATE inbound SET created=0");
+  h.restart();
+  assert.equal(
+    h.store.get("SELECT count(*) AS n FROM jobs WHERE status='pending'").n,
+    0,
+  );
+  await h.bridge.work();
+  assert.equal(h.calls.length, 0);
+});
+
+test("TTL 小于上下文寿命时，领取前和重启后都拒绝过期回程", async (t) => {
+  const h = await setup(t);
+  h.c.ttlMs = 60000;
+  h.c.contextTtlMs = 3600000;
+  h.bridge.ingest(batch(message()));
+  await h.bridge.work();
+  h.bridge.event(event());
+  h.ready();
+  h.bridge.route();
+  h.store.run("UPDATE inbound SET created=?", Date.now() - 60001);
+  await h.bridge.work();
+  assert.equal(
+    h.store.get("SELECT status FROM jobs WHERE kind='wxText'").status,
+    "failed",
+  );
+  h.restart();
+  await h.bridge.work();
+  assert.equal(h.calls.filter((x) => x.path.endsWith("sendmessage")).length, 0);
 });

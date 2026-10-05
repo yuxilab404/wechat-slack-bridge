@@ -20,6 +20,7 @@ export class Store {
     this.db.exec(
       "UPDATE jobs SET status='uncertain', error='进程退出时发送结果不确定' WHERE status='sending'",
     );
+    this.cleanup();
   }
   get(sql: string, ...args: any[]): any {
     return this.db.prepare(sql).get(...args);
@@ -66,9 +67,18 @@ export class Store {
       Date.now(),
     );
   }
+  expirePending() {
+    const cutoff = Date.now() - this.c.ttlMs;
+    this.run(
+      "UPDATE jobs SET status='failed',payload='{}',error='任务已过期' WHERE status='pending' AND (created<=? OR source IN (SELECT id FROM inbound WHERE created<=?))",
+      cutoff,
+      cutoff,
+    );
+  }
   cleanup() {
     const cutoff = Date.now() - this.c.ttlMs;
     this.transaction(() => {
+      this.expirePending();
       this.run(
         "UPDATE jobs SET status=CASE WHEN status='pending' THEN 'failed' ELSE status END,payload='{}',error=CASE WHEN status='pending' THEN '任务已过期' ELSE error END WHERE created<?",
         cutoff,

@@ -144,6 +144,10 @@ export class Bridge {
         e.thread_ts,
       );
       if (!source) continue;
+      if (source.created + this.c.ttlMs <= Date.now()) {
+        this.store.run("UPDATE events SET payload='{}' WHERE id=?", row.id);
+        continue;
+      }
       const text = (e.text ?? "").trim();
       // 静默期不能证明流式完成；文字必须带显式最终标记，文件单独消息可无正文。
       if (text && !text.startsWith(this.c.finalPrefix)) continue;
@@ -175,6 +179,7 @@ export class Bridge {
     }
   }
   async work(signal?: AbortSignal) {
+    this.store.expirePending();
     this.route();
     for (const job of this.store.all(
       "SELECT * FROM jobs WHERE status='pending' AND due<=? ORDER BY created,rowid",
@@ -196,6 +201,7 @@ export class Bridge {
       )
         continue;
       try {
+        this.ensureFresh(job, source);
         if (
           job.kind.startsWith("wx") &&
           (!source.context || Date.now() - source.created > this.c.contextTtlMs)
@@ -229,8 +235,10 @@ export class Bridge {
           });
         } else if (job.kind === "slackImage") {
           const bytes = await this.wx.download(p.item);
+          const fileId = await this.slack.prepareUpload(bytes);
+          this.ensureFresh(job, source);
           this.sending(job.id);
-          await this.slack.upload(bytes, source.root);
+          await this.slack.publishUpload(fileId, source.root);
           this.done(job.id);
         } else {
           let item: any;
@@ -252,6 +260,7 @@ export class Bridge {
               else throw e;
             }
           } else item = { type: 1, text_item: { text: p.text } };
+          this.ensureFresh(job, source);
           if (Date.now() - source.created > this.c.contextTtlMs)
             throw new Fault("微信上下文不可用，等待新消息");
           this.sending(job.id);
@@ -288,6 +297,10 @@ export class Bridge {
         }
       }
     }
+  }
+  ensureFresh(job: any, source: any) {
+    if (Math.min(job.created, source.created) + this.c.ttlMs <= Date.now())
+      throw new Fault("任务已过期");
   }
   sending(id: string) {
     this.store.run("UPDATE jobs SET status='sending' WHERE id=?", id);

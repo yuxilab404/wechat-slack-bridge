@@ -158,7 +158,7 @@ export class Slack {
       throw new Fault("Slack 发送结果不完整", 0, true);
     return r.ts;
   }
-  async upload(bytes: Buffer, thread: string): Promise<void> {
+  async prepareUpload(bytes: Buffer): Promise<string> {
     const ext = imageType(bytes);
     const r = await this.api("files.getUploadURLExternal", {
       filename: `图片.${ext}`,
@@ -171,8 +171,13 @@ export class Slack {
       { "Content-Type": "application/octet-stream" },
       bytes,
     );
+    if (typeof r.file_id !== "string" || !r.file_id)
+      throw new Fault("Slack 文件准备结果不完整", 0, true);
+    return r.file_id;
+  }
+  async publishUpload(fileId: string, thread: string): Promise<void> {
     await this.api("files.completeUploadExternal", {
-      files: [{ id: r.file_id, title: "微信图片" }],
+      files: [{ id: fileId, title: "微信图片" }],
       channel_id: this.c.channel,
       thread_ts: thread,
     });
