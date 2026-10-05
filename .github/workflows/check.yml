@@ -1,0 +1,29 @@
+name: 离线检查
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: 检查-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    name: 代码与离线集成
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - name: 安装锁定依赖
+        run: npm ci --ignore-scripts
+      - name: 检查、测试与编译
+        run: npm run check

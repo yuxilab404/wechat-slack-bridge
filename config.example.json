@@ -1,0 +1,18 @@
+{
+  "team": "TEXAMPLE",
+  "channel": "CEXAMPLE",
+  "dotUser": "UEXAMPLEDOT",
+  "dotBot": "BEXAMPLEDOT",
+  "dotApp": "AEXAMPLEDOT",
+  "bridgeUser": "UEXAMPLEBRIDGE",
+  "secretFile": "./secrets/slack.json",
+  "stateDir": "./state",
+  "apiHosts": ["ilinkai.weixin.qq.com"],
+  "mediaHosts": ["novac2c.cdn.weixin.qq.com", "files.slack.com"],
+  "maxFileBytes": 10485760,
+  "maxStateBytes": 104857600,
+  "ttlMs": 86400000,
+  "contextTtlMs": 3600000,
+  "settleMs": 5000,
+  "finalPrefix": "【最终回复】"
+}
