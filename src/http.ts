@@ -140,13 +140,15 @@ export class Http {
       url,
       hosts,
       body === undefined ? "GET" : "POST",
-      {
-        "Content-Type":
-          body instanceof URLSearchParams
-            ? "application/x-www-form-urlencoded; charset=utf-8"
-            : "application/json",
-        ...headers,
-      },
+      body === undefined
+        ? headers
+        : {
+            "Content-Type":
+              body instanceof URLSearchParams
+                ? "application/x-www-form-urlencoded; charset=utf-8"
+                : "application/json",
+            ...headers,
+          },
       body === undefined
         ? undefined
         : Buffer.from(

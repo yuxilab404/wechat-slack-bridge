@@ -35,3 +35,18 @@
 当前映射仅由桥自身的受信任 Socket 连接收到、完整匹配当前配置的正式新事件建立，记录团队、频道、user、bot、app 的完整组合和本机验证时间。接受的应用字段来自事件顶层或 `bot_profile`，不从正文、昵称或文件描述学习，不自动使用升级前来源不完整的数据库记录。映射与事件一起事务持久化，最长一小时且不超过状态 TTL；配置组合改变、时钟回退、记录损坏或到期均失效。缺字段文件及重复事件不续期。
 
 升级后先让指定 dot 在桥的新根线程发一条带完整应用身份的正常回复，再上传文件。对于只有精确 user/bot、缺少两个应用字段的 `file_share`，有效映射完成应用绑定补核；显式错误应用永远不能被缓存覆盖。无映射时拒绝，不假装已认证。拒绝后不会保存原始文件事件用于自动补投，待映射建立后重新上传到**新微信消息对应线程**验收，避免使用过期 context；不延长微信上下文 TTL。
+
+## 全部 Slack 请求的方法与编码审计
+
+自有适配器仅允许下表前五个已审核接口，按接口选择编码；不提供未知方法的通用 JSON 回退。新增接口必须补官方依据和严格假服务测试。GET 参数通过 URLSearchParams 编码，认证仅放 Authorization 请求头，不放 URL；日志不输出请求 URL。
+
+| 接口 | 本桥采用的方法和编码 | 官方依据及核对结果 |
+| --- | --- | --- |
+| `auth.test` | POST 表单，无业务参数 | [官方接口](https://docs.slack.dev/reference/methods/auth.test/)列出 POST，支持表单/JSON；采用表单 |
+| `chat.postMessage` | POST JSON | [官方说明](https://docs.slack.dev/reference/methods/chat.postMessage/)明确支持 JSON POST，保留线程和禁止展开参数 |
+| `files.info` | GET 查询参数 `file`，无请求体及 Content-Type | [官方接口](https://docs.slack.dev/reference/methods/files.info/)标明 GET；不再发送 JSON POST |
+| `files.getUploadURLExternal` | POST 表单，filename 与十进制 length | [官方接口](https://docs.slack.dev/reference/methods/files.getUploadURLExternal/)支持表单；采用实测成功编码 |
+| `files.completeUploadExternal` | POST 表单，files 数组序列化成 JSON 字符串 | [官方接口](https://docs.slack.dev/reference/methods/files.completeUploadExternal/)支持表单，保留频道和原根线程 |
+| `apps.connections.open` | 官方 Socket SDK 的 POST 表单 | [官方接口](https://docs.slack.dev/reference/methods/apps.connections.open/)；已核对锁定 SDK 源码，并在实际 SDK 假服务测试校验方法、编码和 Authorization |
+
+上传地址使用原始图片字节 POST；私有文件下载使用带认证头的 GET。二者不是 Web API 参数请求，仍有域名、HTTPS、大小、超时及禁止重定向限制。没有调用 `files.upload`、用户身份查询或其他 Slack 接口，没有新增 scope。假服务严格校验本项目选择的契约，不声称 Slack 在所有场景均拒绝其他文档列出的编码。

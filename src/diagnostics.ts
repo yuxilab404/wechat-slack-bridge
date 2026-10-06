@@ -11,6 +11,8 @@ const slackCodes = new Set([
   "token_expired",
   "token_revoked",
   "missing_scope",
+  "file_not_found",
+  "access_denied",
   "no_permission",
   "file_uploads_disabled",
   "file_upload_size_restricted",
@@ -26,7 +28,13 @@ export function slackErrorCode(value: unknown): string {
     ? value
     : "未识别错误";
 }
-const stages = new Set(["申请上传地址", "上传图片字节", "完成图片发布"]);
+const stages = new Set([
+  "申请上传地址",
+  "上传图片字节",
+  "完成图片发布",
+  "查询回程文件信息",
+  "下载回程图片字节",
+]);
 const localCodes = new Set([
   "网络请求失败",
   "接口请求失败",

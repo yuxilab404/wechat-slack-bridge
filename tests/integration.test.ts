@@ -32,6 +32,7 @@ async function setup(t: any, activate = true) {
     body: any;
     bytes: Buffer;
     contentType: string;
+    method: string;
   }[] = [];
   let root = 0;
   const failures = new Map<string, { status: number; count: number }>();
@@ -51,6 +52,42 @@ async function setup(t: any, activate = true) {
       /* 原始媒体请求无需 JSON。 */
     }
     const contentType = req.headers["content-type"] ?? "";
+    const reject = () =>
+      res.end(JSON.stringify({ ok: false, error: "invalid_arguments" }));
+    if (path.startsWith("/api/")) {
+      if (path === "/api/files.info") {
+        const query = new URL(req.url!, "http://fixture.invalid").searchParams;
+        if (
+          req.method !== "GET" ||
+          bytes.length ||
+          contentType ||
+          !query.get("file")
+        ) {
+          reject();
+          return;
+        }
+        body = Object.fromEntries(query);
+      } else if (req.method !== "POST") {
+        reject();
+        return;
+      }
+      if (path === "/api/auth.test") {
+        if (!contentType.startsWith("application/x-www-form-urlencoded")) {
+          reject();
+          return;
+        }
+        body = Object.fromEntries(new URLSearchParams(bytes.toString()));
+      }
+      if (
+        path === "/api/chat.postMessage" &&
+        (!contentType.startsWith("application/json") ||
+          typeof body.text !== "string" ||
+          !body.channel)
+      ) {
+        reject();
+        return;
+      }
+    }
     if (
       path.endsWith("/files.getUploadURLExternal") ||
       path.endsWith("/files.completeUploadExternal")
@@ -83,7 +120,7 @@ async function setup(t: any, activate = true) {
         }
       }
     }
-    calls.push({ path, body, bytes, contentType });
+    calls.push({ path, body, bytes, contentType, method: req.method! });
     const failure = failures.get(path);
     if (failure && failure.count-- > 0) {
       if (failure.status === 0) {
@@ -605,7 +642,14 @@ test("Socket Mode 假服务发送正式事件封套，持久保存后 ACK 并回
   h.bridge.ingest(batch(message()));
   await h.bridge.work();
   let port = 0;
-  const server = createServer((_req, res) => {
+  const server = createServer((req, res) => {
+    assert.equal(req.method, "POST");
+    assert.equal(req.url, "/api/apps.connections.open");
+    assert.match(
+      req.headers["content-type"] ?? "",
+      /^application\/x-www-form-urlencoded/,
+    );
+    assert.equal(req.headers.authorization, "Bearer fixture-socket-token");
     res.setHeader("Content-Type", "application/json");
     res.end(JSON.stringify({ ok: true, url: `ws://127.0.0.1:${port}/socket` }));
   });
@@ -1035,21 +1079,24 @@ test("同批双确认释放缓冲时过滤所有精确确认文字，仅投递�
 
 test("Slack 上传申请及完成严格使用表单，JSON 负例被假服务拒绝", async (t) => {
   const h = await setup(t);
-  await assert.rejects(
-    h.slack.api("files.getUploadURLExternal", {
-      filename: "图片.png",
-      length: png.length,
-    }),
-    (e: any) => e.apiCode === "invalid_arguments",
-  );
-  await assert.rejects(
-    h.slack.api("files.completeUploadExternal", {
-      files: [{ id: "fixture-file" }],
-      channel_id: h.c.channel,
-      thread_ts: "1.000001",
-    }),
-    (e: any) => e.apiCode === "invalid_arguments",
-  );
+  for (const method of [
+    "files.getUploadURLExternal",
+    "files.completeUploadExternal",
+  ]) {
+    const response = await h.http.json(
+      `https://slack.com/api/${method}`,
+      ["slack.com"],
+      {},
+      {
+        filename: "图片.png",
+        length: png.length,
+        files: [{ id: "fixture-file" }],
+        channel_id: h.c.channel,
+        thread_ts: "1.000001",
+      },
+    );
+    assert.equal(response.error, "invalid_arguments");
+  }
   const file = await h.slack.prepareUpload(png);
   await h.slack.publishUpload(file, "1.000001");
   const prepare = h.calls.find((x) =>
@@ -1354,4 +1401,164 @@ test("文件身份补核仍拒绝冒名、错误团队频道、显式错误应�
   reportSlackEvent("虚构正文或签名URL" as any, 3, (line) => lines.push(line));
   reportSlackEvent("收到", Infinity, (line) => lines.push(line));
   assert.deepEqual(lines, ["Slack 事件统计；类别：作者不匹配；累计：2\n"]);
+});
+
+test("全部自有 Slack API 使用显式方法编码，files.info JSON 负例拒绝而 GET 字节回程成功", async (t) => {
+  const h = await setup(t);
+  const rejected = await h.http.json(
+    "https://slack.com/api/files.info",
+    ["slack.com"],
+    {},
+    { file: "fixture-file" },
+  );
+  assert.equal(rejected.error, "invalid_arguments");
+  const wrongAuth = await h.http.json(
+    "https://slack.com/api/auth.test",
+    ["slack.com"],
+    {},
+    {},
+  );
+  assert.equal(wrongAuth.error, "invalid_arguments");
+  const wrongChat = await h.http.json(
+    "https://slack.com/api/chat.postMessage",
+    ["slack.com"],
+    {},
+    new URLSearchParams({ text: "测试", channel: "fixture-channel" }),
+  );
+  assert.equal(wrongChat.error, "invalid_arguments");
+  await h.slack.api("auth.test", {});
+  assert.equal(
+    digest(await h.slack.download({ id: "fixture file&特殊" })),
+    digest(png),
+  );
+  const info = h.calls.find((x) => x.path === "/api/files.info")!;
+  assert.equal(info.method, "GET");
+  assert.equal(info.body.file, "fixture file&特殊");
+  assert.equal(info.bytes.length, 0);
+  assert.equal(info.contentType, "");
+  const auth = h.calls.find((x) => x.path === "/api/auth.test")!;
+  assert.equal(auth.method, "POST");
+  assert.match(auth.contentType, /^application\/x-www-form-urlencoded/);
+  const before = h.calls.length;
+  await assert.rejects(h.slack.api("未审核接口" as any, {}), /未审核/);
+  assert.equal(h.calls.length, before);
+});
+
+test("回程查询与下载阶段错误安全可诊断，失败查询不会触发微信上传或发送", async (t) => {
+  const h = await setup(t);
+  for (const [path, stage] of [
+    ["/api/files.info", "查询回程文件信息"],
+    ["/private/test", "下载回程图片字节"],
+  ]) {
+    h.failures.set(path!, { status: 500, count: 1 });
+    await assert.rejects(
+      h.slack.download({ id: "fixture-file" }),
+      (e: any) => e.stage === stage && e.uncertain,
+    );
+  }
+  h.bridge.ingest(batch(message("110")));
+  await h.bridge.work();
+  h.bridge.event(event("1.000001", "", [{ id: "fixture-file" }]));
+  h.failures.set("/api/files.info", { status: 400, count: 1 });
+  h.ready();
+  await h.bridge.work();
+  assert.match(
+    h.store.get("SELECT error FROM jobs WHERE kind='wxImage'").error,
+    /阶段：查询回程文件信息/,
+  );
+  assert.equal(
+    h.calls.some(
+      (x) => x.path.endsWith("getuploadurl") || x.path.endsWith("sendmessage"),
+    ),
+    false,
+  );
+});
+
+test("回程单条确定查询失败恢复保护 TTL、上下文、根与唯一键，不修改其他任务", async (t) => {
+  const h = await setup(t);
+  const { retryFailedWeixinImage } = await import("../src/recovery.js");
+  h.bridge.ingest(batch(message("111")));
+  await h.bridge.work();
+  h.bridge.event(event("1.000001", "", [{ id: "fixture-file" }]));
+  h.failures.set("/api/files.info", { status: 400, count: 1 });
+  h.ready();
+  await h.bridge.work();
+  const job = h.store.get("SELECT * FROM jobs WHERE kind='wxImage'");
+  const source = h.store.get("SELECT * FROM inbound");
+  h.store.run("UPDATE jobs SET error='Slack 拒绝请求' WHERE id=?", job.id);
+  await assert.rejects(
+    retryFailedWeixinImage(h.c, job.id, source.root, false),
+    /独立确认/,
+  );
+  for (const status of ["done", "uncertain", "sending", "pending"]) {
+    h.store.run("UPDATE jobs SET status=? WHERE id=?", status, job.id);
+    await assert.rejects(
+      retryFailedWeixinImage(h.c, job.id, source.root, true),
+      /条件不满足/,
+    );
+    assert.equal(
+      h.store.get("SELECT status FROM jobs WHERE id=?", job.id).status,
+      status,
+    );
+  }
+  h.store.run("UPDATE jobs SET status='failed',created=0 WHERE id=?", job.id);
+  await assert.rejects(
+    retryFailedWeixinImage(h.c, job.id, source.root, true),
+    /条件不满足/,
+  );
+  h.store.run("UPDATE jobs SET created=? WHERE id=?", job.created, job.id);
+  h.store.run(
+    "UPDATE inbound SET created=? WHERE id=?",
+    Date.now() - h.c.contextTtlMs - 1,
+    source.id,
+  );
+  await assert.rejects(
+    retryFailedWeixinImage(h.c, job.id, source.root, true),
+    /条件不满足/,
+  );
+  h.store.run(
+    "UPDATE inbound SET created=?,context='' WHERE id=?",
+    source.created,
+    source.id,
+  );
+  await assert.rejects(
+    retryFailedWeixinImage(h.c, job.id, source.root, true),
+    /条件不满足/,
+  );
+  h.store.run(
+    "UPDATE inbound SET context=? WHERE id=?",
+    source.context,
+    source.id,
+  );
+  await assert.rejects(
+    retryFailedWeixinImage(h.c, job.id, "999.000001", true),
+    /条件不满足/,
+  );
+  const others = h.store.all(
+    "SELECT * FROM jobs WHERE id!=? ORDER BY id",
+    job.id,
+  );
+  await retryFailedWeixinImage(h.c, job.id, source.root, true);
+  assert.deepEqual(h.store.get("SELECT * FROM inbound"), source);
+  assert.deepEqual(
+    h.store.all("SELECT * FROM jobs WHERE id!=? ORDER BY id", job.id),
+    others,
+  );
+  assert.equal(
+    h.store.get("SELECT payload FROM jobs WHERE id=?", job.id).payload,
+    job.payload,
+  );
+  await h.bridge.work();
+  assert.equal(
+    h.store.get("SELECT status FROM jobs WHERE id=?", job.id).status,
+    "done",
+  );
+  assert.equal(h.calls.filter((x) => x.path.endsWith("sendmessage")).length, 1);
+  assert.equal(
+    h.calls.find((x) => x.path.endsWith("sendmessage"))!.body.msg.context_token,
+    source.context,
+  );
+  h.restart();
+  await h.bridge.work();
+  assert.equal(h.calls.filter((x) => x.path.endsWith("sendmessage")).length, 1);
 });

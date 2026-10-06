@@ -121,18 +121,43 @@ export class Weixin {
     });
   }
 }
+const slackEncoding = {
+  "auth.test": "form",
+  "chat.postMessage": "json",
+  "files.info": "query",
+  "files.getUploadURLExternal": "form",
+  "files.completeUploadExternal": "form",
+} as const;
 export class Slack {
   constructor(
     public c: Config,
     private token: string,
     public http = new Http(),
   ) {}
-  async api(method: string, body: unknown): Promise<any> {
+  async api(
+    method: keyof typeof slackEncoding,
+    body: Record<string, unknown>,
+  ): Promise<any> {
+    if (!Object.hasOwn(slackEncoding, method))
+      throw new Fault("未审核的 Slack 接口");
+    const encoding = slackEncoding[method];
+    const parameters = new URLSearchParams(
+      Object.entries(body)
+        .filter(([, value]) => value !== undefined)
+        .map(([key, value]) => [
+          key,
+          typeof value === "object" ? JSON.stringify(value) : String(value),
+        ]),
+    );
     const r = await this.http.json(
-      `https://slack.com/api/${method}`,
+      `https://slack.com/api/${method}${encoding === "query" ? `?${parameters}` : ""}`,
       ["slack.com"],
       { Authorization: `Bearer ${this.token}` },
-      body,
+      encoding === "query"
+        ? undefined
+        : encoding === "form"
+          ? parameters
+          : body,
     );
     if (!r.ok)
       throw new Fault(
@@ -176,13 +201,10 @@ export class Slack {
   async prepareUpload(bytes: Buffer): Promise<string> {
     const ext = imageType(bytes);
     const r = await this.uploadStage("申请上传地址", async () => {
-      const result = await this.api(
-        "files.getUploadURLExternal",
-        new URLSearchParams({
-          filename: `图片.${ext}`,
-          length: String(bytes.length),
-        }),
-      );
+      const result = await this.api("files.getUploadURLExternal", {
+        filename: `图片.${ext}`,
+        length: bytes.length,
+      });
       if (
         typeof result.file_id !== "string" ||
         !result.file_id ||
@@ -204,31 +226,32 @@ export class Slack {
   }
   async publishUpload(fileId: string, thread: string): Promise<void> {
     await this.uploadStage("完成图片发布", () =>
-      this.api(
-        "files.completeUploadExternal",
-        new URLSearchParams({
-          files: JSON.stringify([{ id: fileId, title: "微信图片" }]),
-          channel_id: this.c.channel,
-          thread_ts: thread,
-        }),
-      ),
+      this.api("files.completeUploadExternal", {
+        files: [{ id: fileId, title: "微信图片" }],
+        channel_id: this.c.channel,
+        thread_ts: thread,
+      }),
     );
   }
   async download(file: any): Promise<Buffer> {
     if (!file.id) throw new Fault("Slack 文件缺少标识");
-    const info = await this.api("files.info", { file: file.id });
+    const info = await this.uploadStage("查询回程文件信息", () =>
+      this.api("files.info", { file: file.id }),
+    );
     const f = info.file;
     if (!f || !/^image\/(png|jpeg|gif|webp)$/.test(f.mimetype ?? ""))
       throw new Fault("仅支持 PNG、JPEG、GIF、WebP 图片");
     if (f.size > this.c.maxFileBytes) throw new Fault("媒体或响应超过限额");
     const bytes = (
-      await this.http.bytes(
-        f.url_private_download || f.url_private,
-        ["files.slack.com"],
-        "GET",
-        { Authorization: `Bearer ${this.token}` },
-        undefined,
-        this.c.maxFileBytes,
+      await this.uploadStage("下载回程图片字节", () =>
+        this.http.bytes(
+          f.url_private_download || f.url_private,
+          ["files.slack.com"],
+          "GET",
+          { Authorization: `Bearer ${this.token}` },
+          undefined,
+          this.c.maxFileBytes,
+        ),
       )
     ).bytes;
     imageType(bytes);
