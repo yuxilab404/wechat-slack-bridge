@@ -55,3 +55,34 @@ export function reportUploadFailure(
   write(message + "\n");
   return message;
 }
+
+export const slackEventReasons = [
+  "收到",
+  "团队不匹配",
+  "频道不匹配",
+  "非消息事件",
+  "作者不匹配",
+  "应用不匹配",
+  "身份映射未验证",
+  "消息类型不支持",
+  "消息格式无效",
+  "重复或过时",
+  "已接收",
+  "已补核文件身份",
+] as const;
+export type SlackEventReason = (typeof slackEventReasons)[number];
+export function reportSlackEvent(
+  reason: SlackEventReason,
+  total: number,
+  write: (line: string) => void = (line) => {
+    process.stderr.write(line);
+  },
+) {
+  if (
+    !slackEventReasons.includes(reason) ||
+    !Number.isSafeInteger(total) ||
+    total < 1
+  )
+    return;
+  write(`Slack 事件统计；类别：${reason}；累计：${total}\n`);
+}

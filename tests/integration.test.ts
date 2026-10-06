@@ -1210,3 +1210,148 @@ test("单条准备失败恢复保留根及去重，拒绝不确定、已完成�
     1,
   );
 });
+
+test("正式完整身份建立映射，缺 app_id 的 file_share 经补核回微信且重启保留映射", async (t) => {
+  const h = await setup(t);
+  h.bridge.ingest(batch(message("100")));
+  await h.bridge.work();
+  h.bridge.event(event());
+  const binding = h.store.meta("slack_verified_identity");
+  assert.ok(binding);
+  h.restart();
+  const fileEvent: any = event("1.000001", "", [
+    { id: "fixture-return-image" },
+  ]);
+  fileEvent.event.ts = "200.000001";
+  fileEvent.event.subtype = "file_share";
+  fileEvent.event.bot_profile = { id: "fixture-dot-bot", name: "虚构机器人" };
+  delete fileEvent.event.app_id;
+  h.bridge.event(fileEvent);
+  assert.equal(h.store.meta("slack_verified_identity"), binding);
+  assert.equal(
+    h.store.get(
+      "SELECT total FROM slack_event_counts WHERE reason='已补核文件身份'",
+    ).total,
+    1,
+  );
+  h.ready();
+  await h.bridge.work();
+  const images = h.calls.filter(
+    (x) => x.path.endsWith("sendmessage") && x.body.msg.item_list[0].type === 2,
+  );
+  assert.equal(images.length, 1);
+  const encrypted = h.calls.find((x) => x.path === "/c2c/upload")!.bytes;
+  const upload = h.calls.find((x) => x.path.endsWith("getuploadurl"))!.body;
+  assert.equal(
+    digest(decrypt(encrypted, Buffer.from(upload.aeskey, "hex"))),
+    digest(png),
+  );
+  h.bridge.event(fileEvent);
+  h.ready();
+  await h.bridge.work();
+  assert.equal(
+    h.calls.filter(
+      (x) =>
+        x.path.endsWith("sendmessage") && x.body.msg.item_list[0].type === 2,
+    ).length,
+    1,
+  );
+});
+
+test("缺 app_id 文件没有映射、映射过期或配置变更均失败关闭且不查询新增权限接口", async (t) => {
+  const h = await setup(t);
+  const fileEvent: any = event("1.000001", "", [{ id: "fixture-file" }]);
+  fileEvent.event.subtype = "file_share";
+  delete fileEvent.event.app_id;
+  h.bridge.event(fileEvent);
+  assert.equal(h.store.all("SELECT * FROM events").length, 0);
+  assert.equal(h.store.meta("slack_verified_identity"), "");
+  h.bridge.event(event());
+  const binding = JSON.parse(h.store.meta("slack_verified_identity"));
+  fileEvent.event.ts = "201.000001";
+  for (const change of [
+    { ...binding, verifiedAt: Date.now() - 3600001 },
+    { ...binding, verifiedAt: Date.now() + 60000 },
+    { ...binding, tuple: "其他身份组合" },
+  ]) {
+    h.store.set("slack_verified_identity", JSON.stringify(change));
+    h.bridge.event(fileEvent);
+  }
+  h.store.set("slack_verified_identity", JSON.stringify(binding));
+  h.c.dotApp = "fixture-other-app";
+  h.bridge.event(fileEvent);
+  assert.equal(h.store.all("SELECT * FROM events").length, 1);
+  assert.equal(
+    h.store.get(
+      "SELECT total FROM slack_event_counts WHERE reason='身份映射未验证'",
+    ).total,
+    5,
+  );
+  assert.equal(h.calls.length, 0);
+});
+
+test("文件身份补核仍拒绝冒名、错误团队频道、显式错误应用及冲突应用字段", async (t) => {
+  const h = await setup(t);
+  h.bridge.event(event());
+  const binding = h.store.meta("slack_verified_identity");
+  const base: any = event("1.000001", "", [{ id: "fixture-file" }]);
+  base.event.ts = "202.000001";
+  base.event.subtype = "file_share";
+  delete base.event.app_id;
+  const variants = [
+    { ...base, team_id: "fixture-wrong-team" },
+    { ...base, event: { ...base.event, channel: "fixture-wrong-channel" } },
+    { ...base, event: { ...base.event, user: "fixture-impostor" } },
+    { ...base, event: { ...base.event, bot_id: "fixture-impostor-bot" } },
+    { ...base, event: { ...base.event, app_id: "fixture-wrong-app" } },
+    { ...base, event: { ...base.event, app_id: null } },
+    {
+      ...base,
+      event: { ...base.event, bot_profile: { app_id: "fixture-wrong-app" } },
+    },
+    {
+      ...base,
+      event: {
+        ...base.event,
+        app_id: h.c.dotApp,
+        bot_profile: { app_id: "fixture-wrong-app" },
+      },
+    },
+    {
+      ...base,
+      event: {
+        ...base.event,
+        app_id: "fixture-wrong-app",
+        bot_profile: { app_id: h.c.dotApp },
+      },
+    },
+    { ...base, event: { ...base.event, subtype: "bot_message" } },
+    { ...base, event: { ...base.event, thread_ts: undefined } },
+  ];
+  for (const value of variants) h.bridge.event(value);
+  assert.equal(h.store.all("SELECT * FROM events").length, 1);
+  assert.equal(h.store.meta("slack_verified_identity"), binding);
+  assert.equal(
+    h.store.get("SELECT total FROM slack_event_counts WHERE reason='收到'")
+      .total,
+    12,
+  );
+  assert.equal(
+    h.store.get(
+      "SELECT total FROM slack_event_counts WHERE reason='作者不匹配'",
+    ).total,
+    2,
+  );
+  assert.equal(
+    h.store.get(
+      "SELECT total FROM slack_event_counts WHERE reason='应用不匹配'",
+    ).total,
+    5,
+  );
+  const { reportSlackEvent } = await import("../src/diagnostics.js");
+  const lines: string[] = [];
+  reportSlackEvent("作者不匹配", 2, (line) => lines.push(line));
+  reportSlackEvent("虚构正文或签名URL" as any, 3, (line) => lines.push(line));
+  reportSlackEvent("收到", Infinity, (line) => lines.push(line));
+  assert.deepEqual(lines, ["Slack 事件统计；类别：作者不匹配；累计：2\n"]);
+});

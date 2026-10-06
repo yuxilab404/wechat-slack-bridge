@@ -3,7 +3,11 @@ import type { Config } from "./config.js";
 import { Store } from "./store.js";
 import { Slack, Weixin } from "./adapters.js";
 import { Fault } from "./http.js";
-import { reportUploadFailure } from "./diagnostics.js";
+import {
+  reportUploadFailure,
+  reportSlackEvent,
+  type SlackEventReason,
+} from "./diagnostics.js";
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 export class Bridge {
   constructor(
@@ -160,55 +164,110 @@ export class Bridge {
     this.store.run("DELETE FROM activation_buffer");
     return buffered;
   }
+  private eventCount(reason: SlackEventReason) {
+    const row = this.store.get(
+      "INSERT INTO slack_event_counts VALUES(?,1) ON CONFLICT(reason) DO UPDATE SET total=total+1 RETURNING total",
+      reason,
+    );
+    reportSlackEvent(reason, row.total);
+  }
+  private identityTuple() {
+    return JSON.stringify([
+      this.c.team,
+      this.c.channel,
+      this.c.dotUser,
+      this.c.dotBot,
+      this.c.dotApp,
+    ]);
+  }
+  private verifiedIdentity() {
+    try {
+      const binding = JSON.parse(this.store.meta("slack_verified_identity"));
+      const age = Date.now() - binding.verifiedAt;
+      return (
+        binding.tuple === this.identityTuple() &&
+        Number.isSafeInteger(binding.verifiedAt) &&
+        age >= 0 &&
+        age < Math.min(this.c.ttlMs, 3600000)
+      );
+    } catch {
+      return false;
+    }
+  }
   event(envelope: any) {
-    const outer = envelope.event;
-    if (
-      envelope.team_id !== this.c.team ||
-      outer?.type !== "message" ||
-      outer.channel !== this.c.channel
-    )
-      return;
+    this.eventCount("收到");
+    const outer = envelope?.event;
+    if (envelope?.team_id !== this.c.team) return this.eventCount("团队不匹配");
+    if (outer?.type !== "message") return this.eventCount("非消息事件");
+    if (outer.channel !== this.c.channel) return this.eventCount("频道不匹配");
     const changed = outer.subtype === "message_changed";
     const e = changed ? outer.message : outer;
     if (
       !e ||
       e.user !== this.c.dotUser ||
       e.bot_id !== this.c.dotBot ||
-      e.app_id !== this.c.dotApp ||
       e.user === this.c.bridgeUser
     )
-      return;
-    if (e.subtype && !["bot_message", "file_share"].includes(e.subtype)) return;
+      return this.eventCount("作者不匹配");
+    if (
+      (e.app_id !== undefined && e.app_id !== this.c.dotApp) ||
+      (e.bot_profile?.app_id !== undefined &&
+        e.bot_profile.app_id !== this.c.dotApp)
+    )
+      return this.eventCount("应用不匹配");
+    if (e.subtype && !["bot_message", "file_share"].includes(e.subtype))
+      return this.eventCount("消息类型不支持");
     if (
       typeof e.ts !== "string" ||
       !/^\d+\.\d+$/.test(e.ts) ||
       typeof e.thread_ts !== "string" ||
-      e.ts === e.thread_ts
+      !/^\d+\.\d+$/.test(e.thread_ts) ||
+      e.ts === e.thread_ts ||
+      (e.text !== undefined && typeof e.text !== "string") ||
+      (e.files !== undefined &&
+        (!Array.isArray(e.files) || e.files.length > 10))
     )
-      return;
-    if (typeof e.text !== "undefined" && typeof e.text !== "string") return;
-    if (
-      e.files !== undefined &&
-      (!Array.isArray(e.files) || e.files.length > 10)
-    )
-      return;
+      return this.eventCount("消息格式无效");
+    const hasApp =
+      e.app_id === this.c.dotApp || e.bot_profile?.app_id === this.c.dotApp;
+    const verifiedFile =
+      !hasApp &&
+      e.subtype === "file_share" &&
+      e.files?.length > 0 &&
+      this.verifiedIdentity();
+    if (!hasApp && !verifiedFile) return this.eventCount("身份映射未验证");
     const id = hash(`${this.c.team}:${this.c.channel}:${e.ts}`);
     const version = e.edited?.ts ?? outer.event_ts ?? e.ts;
-    if (typeof version !== "string" || !/^\d+\.\d+$/.test(version)) return;
+    if (typeof version !== "string" || !/^\d+\.\d+$/.test(version))
+      return this.eventCount("消息格式无效");
     this.store.capacity();
     const previous = this.store.get(
       "SELECT version FROM events WHERE id=?",
       id,
     );
-    if (previous && compareTs(previous.version, version) >= 0) return;
-    this.store.run(
-      "INSERT INTO events VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,due=excluded.due,version=excluded.version",
-      id,
-      JSON.stringify(e),
-      Date.now() + this.c.settleMs,
-      Date.now(),
-      version,
-    );
+    if (previous && compareTs(previous.version, version) >= 0)
+      return this.eventCount("重复或过时");
+    this.store.transaction(() => {
+      this.store.run(
+        "INSERT INTO events VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,due=excluded.due,version=excluded.version",
+        id,
+        JSON.stringify(e),
+        Date.now() + this.c.settleMs,
+        Date.now(),
+        version,
+      );
+      // 仅完整验证的新正式事件建立映射；缺字段文件和重复事件不能续期。
+      if (hasApp)
+        this.store.set(
+          "slack_verified_identity",
+          JSON.stringify({
+            tuple: this.identityTuple(),
+            verifiedAt: Date.now(),
+          }),
+        );
+      if (verifiedFile) this.eventCount("已补核文件身份");
+      this.eventCount("已接收");
+    });
   }
   route() {
     for (const row of this.store.all(

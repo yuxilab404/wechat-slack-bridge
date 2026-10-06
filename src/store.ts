@@ -12,6 +12,7 @@ export class Store {
     chmodSync(join(c.stateDir, "bridge.sqlite"), 0o600);
     this.db
       .exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;
+      CREATE TABLE IF NOT EXISTS slack_event_counts(reason TEXT PRIMARY KEY,total INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS activation_buffer(id TEXT PRIMARY KEY,payload TEXT NOT NULL,created INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS inbound(id TEXT PRIMARY KEY,payload TEXT NOT NULL,context TEXT NOT NULL,sender TEXT NOT NULL,created INTEGER NOT NULL,root TEXT UNIQUE,source_ts TEXT,final INTEGER NOT NULL DEFAULT 0);
