@@ -945,3 +945,52 @@ test("旧版本状态升级必须确认，旧待发送内容不会随启用泄�
   assert.equal(h.store.get("SELECT context FROM inbound").context, "");
   assert.equal(h.store.get("SELECT payload FROM jobs").payload, "{}");
 });
+
+test("启用后重复确认和重启后的确认均不进入 Slack，也不移动边界", async (t) => {
+  const h = await setup(t);
+  const boundary = h.store.meta("activation_boundary");
+  const command = h.bridge.activationCommand;
+  for (const id of ["51", "52"]) {
+    h.setUpdates(
+      batch(message(id, [{ type: 1, text_item: { text: command } }])),
+    );
+    h.bridge.ingest(await h.wx.updates(h.store.meta("cursor")));
+    await h.bridge.work();
+    assert.equal(h.store.meta("activation_boundary"), boundary);
+    assert.equal(h.store.all("SELECT * FROM inbound").length, 0);
+    assert.equal(h.store.all("SELECT * FROM jobs").length, 0);
+    h.restart();
+  }
+  h.setUpdates(batch(message("53")));
+  h.bridge.ingest(await h.wx.updates(h.store.meta("cursor")));
+  await h.bridge.work();
+  const posts = h.calls.filter((x) => x.path.endsWith("chat.postMessage"));
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0]!.body.text, "【微信消息就绪】\n你好，测试");
+  assert.equal(h.store.meta("activation_boundary"), boundary);
+});
+
+test("同批双确认释放缓冲时过滤所有精确确认文字，仅投递后续业务消息", async (t) => {
+  const h = await setup(t, false);
+  const time = Date.now() - 1000;
+  const confirm = (id: string, offset: number) => ({
+    ...message(id, [
+      { type: 1, text_item: { text: h.bridge.activationCommand } },
+    ]),
+    create_time_ms: time + offset,
+  });
+  h.setUpdates(
+    batch(confirm("60", 0), confirm("61", 1), {
+      ...message("62"),
+      create_time_ms: time + 2,
+    }),
+  );
+  h.bridge.ingest(await h.wx.updates(""));
+  await h.bridge.work();
+  assert.equal(h.store.meta("activation_boundary"), String(time));
+  assert.equal(h.store.all("SELECT * FROM activation_buffer").length, 0);
+  assert.equal(h.store.all("SELECT * FROM inbound").length, 1);
+  const posts = h.calls.filter((x) => x.path.endsWith("chat.postMessage"));
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0]!.body.text, "【微信消息就绪】\n你好，测试");
+});

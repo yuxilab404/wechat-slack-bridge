@@ -129,7 +129,14 @@ export class Bridge {
     );
     if (valid.some((m) => m.create_time_ms > now + 300000))
       throw new Fault("微信消息时间异常，游标未推进");
-    if (this.activated) return valid.filter((m) => m.create_time_ms > boundary);
+    const isConfirmation = (m: any) =>
+      m.item_list.length === 1 &&
+      m.item_list[0].type === 1 &&
+      m.item_list[0].text_item?.text === this.activationCommand;
+    if (this.activated)
+      return valid.filter(
+        (m) => m.create_time_ms > boundary && !isConfirmation(m),
+      );
     for (const m of valid) {
       this.store.run(
         "INSERT OR IGNORE INTO activation_buffer VALUES(?,?,?)",
@@ -138,19 +145,17 @@ export class Bridge {
         now,
       );
     }
-    const confirmation = valid.find(
-      (m) =>
-        m.item_list.length === 1 &&
-        m.item_list[0].type === 1 &&
-        m.item_list[0].text_item?.text === this.activationCommand,
-    );
+    const confirmation = valid.find(isConfirmation);
     if (!confirmation) return [];
     this.store.set("activation_boundary", String(confirmation.create_time_ms));
     // 确认消息可能比随后发送的消息更晚到达，不能只看当前批次。
     const buffered = this.store
       .all("SELECT payload FROM activation_buffer")
       .map((row) => JSON.parse(row.payload))
-      .filter((m) => m.create_time_ms > confirmation.create_time_ms);
+      .filter(
+        (m) =>
+          m.create_time_ms > confirmation.create_time_ms && !isConfirmation(m),
+      );
     this.store.run("DELETE FROM activation_buffer");
     return buffered;
   }
