@@ -96,12 +96,26 @@ async function main() {
       process.once(signal, () => stop.abort());
     try {
       await socket.start();
-      console.log("桥接服务已启动。");
+      if (bridge.activated) {
+        console.log("桥接服务已启动，沿用已保存的启用边界。");
+      } else {
+        writeFileSync(
+          join(c.stateDir, "启用确认.txt"),
+          bridge.activationCommand + "\n",
+          { mode: 0o600 },
+        );
+        console.log(
+          "桥接尚未启用，请读取状态目录的启用确认.txt，由扫码本人将整行内容发送至微信私聊。",
+        );
+      }
       const polling = async () => {
         let failures = 0;
         while (!stop.signal.aborted) {
           try {
+            const wasActivated = bridge.activated;
             bridge.ingest(await wx.updates(store.meta("cursor")));
+            if (!wasActivated && bridge.activated)
+              console.log("主人已确认启用；只转发确认时间之后的微信消息。");
             lastPoll = Date.now();
             failures = 0;
             await wait(250, stop.signal);

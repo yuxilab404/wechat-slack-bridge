@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { Config } from "./config.js";
 import { Store } from "./store.js";
 import { Slack, Weixin } from "./adapters.js";
@@ -18,6 +18,24 @@ export class Bridge {
     if (store.meta("account") && store.meta("account") !== account)
       throw new Fault("状态目录属于另一微信账号，请使用新目录");
     store.set("account", account);
+    const savedBoundary = store.meta("activation_boundary");
+    if (
+      savedBoundary &&
+      (!Number.isSafeInteger(Number(savedBoundary)) ||
+        Number(savedBoundary) <= 0)
+    )
+      throw new Fault("启用边界损坏，拒绝自动恢复");
+    if (!store.meta("activation_challenge")) {
+      store.transaction(() => {
+        store.set("activation_challenge", randomBytes(16).toString("hex"));
+        // 旧版本没有可信启用边界，升级时不自动继续旧的待发送任务。
+        store.run(
+          "UPDATE jobs SET status='failed',payload='{}',error='等待主人重新确认启用' WHERE status='pending'",
+        );
+        store.run("UPDATE events SET payload='{}'");
+        store.run("UPDATE inbound SET context=''");
+      });
+    }
   }
   ingest(batch: any) {
     this.store.capacity();
@@ -27,7 +45,7 @@ export class Bridge {
     )
       throw new Fault("微信更新格式无效");
     this.store.transaction(() => {
-      for (const m of batch.msgs ?? []) {
+      for (const m of this.activationMessages(batch.msgs ?? [])) {
         if (
           m.from_user_id !== this.wx.session.ilink_user_id ||
           m.group_id ||
@@ -82,6 +100,59 @@ export class Bridge {
       if (batch.get_updates_buf)
         this.store.set("cursor", batch.get_updates_buf);
     });
+  }
+  get activationCommand() {
+    return `启用桥接 ${this.store.meta("activation_challenge")}`;
+  }
+  get activated() {
+    return Boolean(this.store.meta("activation_boundary"));
+  }
+  private activationMessages(messages: any[]): any[] {
+    const now = Date.now();
+    const boundary = Number(this.store.meta("activation_boundary"));
+    // 五分钟只用于检测异常时钟，绝不将启用边界向过去放宽。
+    if (boundary > now + 300000) throw new Fault("本机时钟异常，微信同步暂停");
+    const valid = messages.filter(
+      (m) =>
+        m &&
+        m.from_user_id === this.wx.session.ilink_user_id &&
+        m.to_user_id === this.wx.session.ilink_bot_id &&
+        !m.group_id &&
+        m.message_type === 1 &&
+        m.message_state === 2 &&
+        /^[0-9]{1,20}$/.test(String(m.message_id)) &&
+        BigInt(m.message_id) <= 18446744073709551615n &&
+        Array.isArray(m.item_list) &&
+        m.item_list.length <= 20 &&
+        Number.isSafeInteger(m.create_time_ms) &&
+        m.create_time_ms > 0,
+    );
+    if (valid.some((m) => m.create_time_ms > now + 300000))
+      throw new Fault("微信消息时间异常，游标未推进");
+    if (this.activated) return valid.filter((m) => m.create_time_ms > boundary);
+    for (const m of valid) {
+      this.store.run(
+        "INSERT OR IGNORE INTO activation_buffer VALUES(?,?,?)",
+        String(m.message_id),
+        JSON.stringify(m),
+        now,
+      );
+    }
+    const confirmation = valid.find(
+      (m) =>
+        m.item_list.length === 1 &&
+        m.item_list[0].type === 1 &&
+        m.item_list[0].text_item?.text === this.activationCommand,
+    );
+    if (!confirmation) return [];
+    this.store.set("activation_boundary", String(confirmation.create_time_ms));
+    // 确认消息可能比随后发送的消息更晚到达，不能只看当前批次。
+    const buffered = this.store
+      .all("SELECT payload FROM activation_buffer")
+      .map((row) => JSON.parse(row.payload))
+      .filter((m) => m.create_time_ms > confirmation.create_time_ms);
+    this.store.run("DELETE FROM activation_buffer");
+    return buffered;
   }
   event(envelope: any) {
     const outer = envelope.event;
@@ -179,6 +250,7 @@ export class Bridge {
     }
   }
   async work(signal?: AbortSignal) {
+    if (!this.activated) return;
     this.store.expirePending();
     this.route();
     for (const job of this.store.all(

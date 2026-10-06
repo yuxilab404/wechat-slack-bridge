@@ -25,7 +25,7 @@ const session = {
   ilink_user_id: "fixture-owner",
   baseurl: "https://ilinkai.weixin.qq.com",
 };
-async function setup(t: any) {
+async function setup(t: any, activate = true) {
   const dir = mkdtempSync(join(tmpdir(), "bridge-"));
   const calls: { path: string; body: any; bytes: Buffer }[] = [];
   let root = 0;
@@ -33,6 +33,7 @@ async function setup(t: any) {
   let uploadKey = key;
   let mime = "image/png";
   let url = "https://files.slack.com/private/test";
+  let updates: any;
   const server = createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -57,6 +58,10 @@ async function setup(t: any) {
     }
     let data: any = { ok: true, ret: 0 };
     if (path.endsWith("/getupdates")) {
+      if (updates) {
+        res.end(JSON.stringify(updates));
+        return;
+      }
       res.end(
         '{"ret":0,"msgs":[' +
           JSON.stringify(message("18446744073709551615")).replace(
@@ -140,6 +145,13 @@ async function setup(t: any) {
     slack = new Slack(c, "fixture-slack-token", http);
   let store = new Store(c);
   let bridge = new Bridge(c, store, wx, slack);
+  if (activate) {
+    const confirmation = message("0", [
+      { type: 1, text_item: { text: bridge.activationCommand } },
+    ]);
+    confirmation.create_time_ms = Date.now() - 1000;
+    bridge.ingest({ msgs: [confirmation] });
+  }
   t.after(async () => {
     store.close();
     await new Promise<void>((r, e) =>
@@ -165,6 +177,9 @@ async function setup(t: any) {
       store = new Store(c);
       bridge = new Bridge(c, store, wx, slack);
     },
+    setUpdates(v: any) {
+      updates = v;
+    },
     setMime(v: string) {
       mime = v;
     },
@@ -183,6 +198,7 @@ function message(
 ) {
   return {
     message_id: id,
+    create_time_ms: Date.now(),
     from_user_id: session.ilink_user_id,
     to_user_id: session.ilink_bot_id,
     message_type: 1,
@@ -752,4 +768,180 @@ test("TTL 小于上下文寿命时，领取前和重启后都拒绝过期回程"
   h.restart();
   await h.bridge.work();
   assert.equal(h.calls.filter((x) => x.path.endsWith("sendmessage")).length, 0);
+});
+
+test("首次启用隔离历史文本和图片，确认后混合批次的新图片按原始字节投递", async (t) => {
+  const h = await setup(t, false);
+  const base = Date.now() - 1000;
+  const picture = {
+    type: 2,
+    image_item: {
+      media: {
+        encrypt_query_param: "fixture",
+        aes_key: key.toString("base64"),
+      },
+    },
+  };
+  const dated = (id: string, at: number, items?: any[]) => ({
+    ...message(id, items),
+    create_time_ms: at,
+  });
+  h.setUpdates(batch(dated("1", base, [picture]), dated("2", base)));
+  h.bridge.ingest(await h.wx.updates(""));
+  await h.bridge.work();
+  assert.equal(h.store.all("SELECT * FROM jobs").length, 0);
+  assert.deepEqual(
+    h.calls.map((x) => x.path),
+    ["/ilink/bot/getupdates"],
+  );
+  h.setUpdates(
+    batch(
+      dated("3", base + 200, [
+        { type: 1, text_item: { text: h.bridge.activationCommand } },
+      ]),
+      dated("4", base + 199, [picture]),
+      dated("5", base + 201, [
+        { type: 1, text_item: { text: "启用后的文字" } },
+        picture,
+      ]),
+    ),
+  );
+  h.bridge.ingest(await h.wx.updates(h.store.meta("cursor")));
+  await h.bridge.work();
+  assert.equal(h.store.all("SELECT * FROM inbound").length, 1);
+  assert.equal(
+    digest(h.calls.find((x) => x.path === "/upload/test")!.bytes),
+    digest(png),
+  );
+  assert.match(
+    h.calls.find((x) => x.path.endsWith("chat.postMessage"))!.body.text,
+    /启用后的文字/,
+  );
+  assert.equal(h.calls.filter((x) => x.path === "/c2c/download").length, 1);
+});
+
+test("启用确认乱序和重启保留缓冲及边界，不丢随后消息且不重放历史", async (t) => {
+  const h = await setup(t, false);
+  const boundary = Date.now() - 1000;
+  const command = h.bridge.activationCommand;
+  const newer = { ...message("10"), create_time_ms: boundary + 1 };
+  h.setUpdates(batch(newer));
+  h.bridge.ingest(await h.wx.updates(""));
+  h.restart();
+  assert.equal(h.bridge.activationCommand, command);
+  assert.equal(h.bridge.activated, false);
+  h.setUpdates(
+    batch({
+      ...message("11", [{ type: 1, text_item: { text: command } }]),
+      create_time_ms: boundary,
+    }),
+  );
+  h.bridge.ingest(await h.wx.updates(h.store.meta("cursor")));
+  await h.bridge.work();
+  assert.equal(h.store.all("SELECT * FROM inbound").length, 1);
+  h.restart();
+  assert.equal(h.store.meta("activation_boundary"), String(boundary));
+  h.setUpdates(
+    batch(
+      newer,
+      { ...message("12"), create_time_ms: boundary - 1 },
+      { ...message("13"), create_time_ms: boundary + 2 },
+    ),
+  );
+  h.bridge.ingest(await h.wx.updates(h.store.meta("cursor")));
+  await h.bridge.work();
+  assert.equal(
+    h.calls.filter((x) => x.path.endsWith("chat.postMessage")).length,
+    2,
+  );
+  assert.equal(h.store.all("SELECT * FROM activation_buffer").length, 0);
+});
+
+test("缺失非法时间和非主人确认均失败关闭，边界同毫秒不猜先后", async (t) => {
+  const h = await setup(t, false);
+  const base = Date.now() - 1000;
+  const confirmation = {
+    ...message("20", [
+      { type: 1, text_item: { text: h.bridge.activationCommand } },
+    ]),
+    create_time_ms: base,
+  };
+  h.bridge.ingest(
+    batch(
+      { ...confirmation, from_user_id: "fixture-stranger" },
+      { ...confirmation, create_time_ms: undefined },
+    ),
+  );
+  assert.equal(h.bridge.activated, false);
+  h.bridge.ingest(batch(confirmation));
+  for (const time of [
+    undefined,
+    null,
+    "1700000000000",
+    0,
+    -1,
+    1.5,
+    Number.MAX_SAFE_INTEGER + 1,
+    base,
+  ]) {
+    h.setUpdates(batch({ ...message("21"), create_time_ms: time }));
+    h.bridge.ingest(await h.wx.updates(h.store.meta("cursor")));
+  }
+  await h.bridge.work();
+  assert.equal(h.store.all("SELECT * FROM jobs").length, 0);
+  assert.equal(
+    h.calls.some((x) => x.path.endsWith("chat.postMessage")),
+    false,
+  );
+});
+
+test("异常未来时间不推进游标，修正后可重试；五分钟容差不放宽历史边界", async (t) => {
+  const h = await setup(t, false);
+  const now = Date.now();
+  const confirmation = message("30", [
+    { type: 1, text_item: { text: h.bridge.activationCommand } },
+  ]);
+  h.bridge.ingest({
+    msgs: [{ ...confirmation, create_time_ms: now + 10000 }],
+    get_updates_buf: "before",
+  });
+  h.setUpdates({
+    msgs: [{ ...message("31"), create_time_ms: now + 600000 }],
+    get_updates_buf: "after",
+  });
+  assert.throws(
+    () =>
+      h.bridge.ingest({
+        msgs: [{ ...message("31"), create_time_ms: now + 600000 }],
+        get_updates_buf: "after",
+      }),
+    /时间异常/,
+  );
+  assert.equal(h.store.meta("cursor"), "before");
+  h.setUpdates(
+    batch(
+      { ...message("32"), create_time_ms: now + 9999 },
+      { ...message("31"), create_time_ms: now + 10001 },
+    ),
+  );
+  h.bridge.ingest(await h.wx.updates("before"));
+  await h.bridge.work();
+  assert.equal(h.store.all("SELECT * FROM inbound").length, 1);
+  h.store.set("activation_boundary", String(now + 600000));
+  assert.throws(() => h.bridge.ingest(batch(message("33"))), /本机时钟异常/);
+});
+
+test("旧版本状态升级必须确认，旧待发送内容不会随启用泄漏", async (t) => {
+  const h = await setup(t);
+  h.bridge.ingest(batch(message("40")));
+  h.store.run(
+    "DELETE FROM meta WHERE k IN ('activation_challenge','activation_boundary')",
+  );
+  h.restart();
+  assert.equal(h.bridge.activated, false);
+  await h.bridge.work();
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.store.get("SELECT status FROM jobs").status, "failed");
+  assert.equal(h.store.get("SELECT context FROM inbound").context, "");
+  assert.equal(h.store.get("SELECT payload FROM jobs").payload, "{}");
 });

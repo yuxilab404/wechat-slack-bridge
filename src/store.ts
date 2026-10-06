@@ -13,6 +13,7 @@ export class Store {
     this.db
       .exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;
       CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY,v TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS activation_buffer(id TEXT PRIMARY KEY,payload TEXT NOT NULL,created INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS inbound(id TEXT PRIMARY KEY,payload TEXT NOT NULL,context TEXT NOT NULL,sender TEXT NOT NULL,created INTEGER NOT NULL,root TEXT UNIQUE,source_ts TEXT,final INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,payload TEXT NOT NULL,due INTEGER NOT NULL,created INTEGER NOT NULL,version TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,source TEXT NOT NULL,kind TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',due INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL,error TEXT);
@@ -79,6 +80,7 @@ export class Store {
     const cutoff = Date.now() - this.c.ttlMs;
     this.transaction(() => {
       this.expirePending();
+      this.run("DELETE FROM activation_buffer WHERE created<=?", cutoff);
       this.run(
         "UPDATE jobs SET status=CASE WHEN status='pending' THEN 'failed' ELSE status END,payload='{}',error=CASE WHEN status='pending' THEN '任务已过期' ELSE error END WHERE created<?",
         cutoff,
