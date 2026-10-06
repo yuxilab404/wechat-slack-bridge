@@ -3,6 +3,7 @@ import type { Config } from "./config.js";
 import { Store } from "./store.js";
 import { Slack, Weixin } from "./adapters.js";
 import { Fault } from "./http.js";
+import { reportUploadFailure } from "./diagnostics.js";
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 export class Bridge {
   constructor(
@@ -346,6 +347,7 @@ export class Bridge {
         }
       } catch (e) {
         const f = e instanceof Fault ? e : new Fault("处理失败");
+        const diagnostic = reportUploadFailure(f);
         const sending =
           this.store.get("SELECT status FROM jobs WHERE id=?", job.id)
             .status === "sending";
@@ -359,7 +361,7 @@ export class Bridge {
           "UPDATE jobs SET status=?,due=?,error=? WHERE id=?",
           status,
           Date.now() + (f.retryMs || 30000),
-          f.code,
+          diagnostic || f.code,
           job.id,
         );
         if (

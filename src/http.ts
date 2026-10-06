@@ -8,6 +8,8 @@ export class Fault extends Error {
     public code: string,
     public retryMs = 0,
     public uncertain = false,
+    public stage = "",
+    public apiCode = "",
   ) {
     super(code);
   }
@@ -138,8 +140,20 @@ export class Http {
       url,
       hosts,
       body === undefined ? "GET" : "POST",
-      { "Content-Type": "application/json", ...headers },
-      body === undefined ? undefined : Buffer.from(JSON.stringify(body)),
+      {
+        "Content-Type":
+          body instanceof URLSearchParams
+            ? "application/x-www-form-urlencoded; charset=utf-8"
+            : "application/json",
+        ...headers,
+      },
+      body === undefined
+        ? undefined
+        : Buffer.from(
+            body instanceof URLSearchParams
+              ? body.toString()
+              : JSON.stringify(body),
+          ),
     );
     try {
       return parse(r.bytes.toString("utf8"), (_key, value) =>

@@ -2,6 +2,7 @@ import { randomBytes, createHash } from "node:crypto";
 import type { Config, Session } from "./config.js";
 import { Http, Fault, checkUrl } from "./http.js";
 import { aesKey, decrypt, encrypt, imageType } from "./media.js";
+import { slackErrorCode } from "./diagnostics.js";
 export class Weixin {
   constructor(
     public c: Config,
@@ -143,6 +144,8 @@ export class Slack {
           "request_timeout",
           "service_unavailable",
         ].includes(r.error),
+        "",
+        slackErrorCode(r.error),
       );
     return r;
   }
@@ -158,29 +161,58 @@ export class Slack {
       throw new Fault("Slack 发送结果不完整", 0, true);
     return r.ts;
   }
+  private async uploadStage<T>(
+    stage: string,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await action();
+    } catch (e) {
+      const f = e instanceof Fault ? e : new Fault("处理失败");
+      f.stage = stage;
+      throw f;
+    }
+  }
   async prepareUpload(bytes: Buffer): Promise<string> {
     const ext = imageType(bytes);
-    const r = await this.api("files.getUploadURLExternal", {
-      filename: `图片.${ext}`,
-      length: bytes.length,
+    const r = await this.uploadStage("申请上传地址", async () => {
+      const result = await this.api(
+        "files.getUploadURLExternal",
+        new URLSearchParams({
+          filename: `图片.${ext}`,
+          length: String(bytes.length),
+        }),
+      );
+      if (
+        typeof result.file_id !== "string" ||
+        !result.file_id ||
+        typeof result.upload_url !== "string"
+      )
+        throw new Fault("Slack 文件准备结果不完整", 0, true);
+      return result;
     });
-    await this.http.bytes(
-      r.upload_url,
-      this.c.mediaHosts,
-      "POST",
-      { "Content-Type": "application/octet-stream" },
-      bytes,
+    await this.uploadStage("上传图片字节", () =>
+      this.http.bytes(
+        r.upload_url,
+        this.c.mediaHosts,
+        "POST",
+        { "Content-Type": "application/octet-stream" },
+        bytes,
+      ),
     );
-    if (typeof r.file_id !== "string" || !r.file_id)
-      throw new Fault("Slack 文件准备结果不完整", 0, true);
     return r.file_id;
   }
   async publishUpload(fileId: string, thread: string): Promise<void> {
-    await this.api("files.completeUploadExternal", {
-      files: [{ id: fileId, title: "微信图片" }],
-      channel_id: this.c.channel,
-      thread_ts: thread,
-    });
+    await this.uploadStage("完成图片发布", () =>
+      this.api(
+        "files.completeUploadExternal",
+        new URLSearchParams({
+          files: JSON.stringify([{ id: fileId, title: "微信图片" }]),
+          channel_id: this.c.channel,
+          thread_ts: thread,
+        }),
+      ),
+    );
   }
   async download(file: any): Promise<Buffer> {
     if (!file.id) throw new Fault("Slack 文件缺少标识");

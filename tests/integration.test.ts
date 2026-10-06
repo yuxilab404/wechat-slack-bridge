@@ -27,7 +27,12 @@ const session = {
 };
 async function setup(t: any, activate = true) {
   const dir = mkdtempSync(join(tmpdir(), "bridge-"));
-  const calls: { path: string; body: any; bytes: Buffer }[] = [];
+  const calls: {
+    path: string;
+    body: any;
+    bytes: Buffer;
+    contentType: string;
+  }[] = [];
   let root = 0;
   const failures = new Map<string, { status: number; count: number }>();
   let uploadKey = key;
@@ -45,7 +50,40 @@ async function setup(t: any, activate = true) {
     } catch {
       /* 原始媒体请求无需 JSON。 */
     }
-    calls.push({ path, body, bytes });
+    const contentType = req.headers["content-type"] ?? "";
+    if (
+      path.endsWith("/files.getUploadURLExternal") ||
+      path.endsWith("/files.completeUploadExternal")
+    ) {
+      // 严格模拟已观察到的表单契约，拒绝 JSON，避免假服务掩盖接口兼容差异。
+      if (!contentType.startsWith("application/x-www-form-urlencoded")) {
+        res.end(JSON.stringify({ ok: false, error: "invalid_arguments" }));
+        return;
+      }
+      body = Object.fromEntries(new URLSearchParams(bytes.toString()));
+      if (path.endsWith("/files.getUploadURLExternal")) {
+        if (!body.filename || !/^[1-9][0-9]*$/.test(body.length)) {
+          res.end(JSON.stringify({ ok: false, error: "invalid_arguments" }));
+          return;
+        }
+      } else {
+        try {
+          body.files = JSON.parse(body.files);
+        } catch {
+          body.files = null;
+        }
+        if (
+          !Array.isArray(body.files) ||
+          !body.files[0]?.id ||
+          !body.channel_id ||
+          !body.thread_ts
+        ) {
+          res.end(JSON.stringify({ ok: false, error: "invalid_arguments" }));
+          return;
+        }
+      }
+    }
+    calls.push({ path, body, bytes, contentType });
     const failure = failures.get(path);
     if (failure && failure.count-- > 0) {
       if (failure.status === 0) {
@@ -993,4 +1031,182 @@ test("同批双确认释放缓冲时过滤所有精确确认文字，仅投递�
   const posts = h.calls.filter((x) => x.path.endsWith("chat.postMessage"));
   assert.equal(posts.length, 1);
   assert.equal(posts[0]!.body.text, "【微信消息就绪】\n你好，测试");
+});
+
+test("Slack 上传申请及完成严格使用表单，JSON 负例被假服务拒绝", async (t) => {
+  const h = await setup(t);
+  await assert.rejects(
+    h.slack.api("files.getUploadURLExternal", {
+      filename: "图片.png",
+      length: png.length,
+    }),
+    (e: any) => e.apiCode === "invalid_arguments",
+  );
+  await assert.rejects(
+    h.slack.api("files.completeUploadExternal", {
+      files: [{ id: "fixture-file" }],
+      channel_id: h.c.channel,
+      thread_ts: "1.000001",
+    }),
+    (e: any) => e.apiCode === "invalid_arguments",
+  );
+  const file = await h.slack.prepareUpload(png);
+  await h.slack.publishUpload(file, "1.000001");
+  const prepare = h.calls.find((x) =>
+    x.path.endsWith("files.getUploadURLExternal"),
+  )!;
+  assert.match(prepare.contentType, /^application\/x-www-form-urlencoded/);
+  assert.equal(prepare.body.filename, "图片.png");
+  assert.equal(prepare.body.length, String(png.length));
+  assert.equal(
+    digest(h.calls.find((x) => x.path === "/upload/test")!.bytes),
+    digest(png),
+  );
+  const complete = h.calls.find((x) =>
+    x.path.endsWith("files.completeUploadExternal"),
+  )!;
+  assert.match(complete.contentType, /^application\/x-www-form-urlencoded/);
+  assert.deepEqual(complete.body.files, [{ id: file, title: "微信图片" }]);
+  assert.equal(complete.body.thread_ts, "1.000001");
+  assert.equal(complete.body.channel_id, h.c.channel);
+  assert.equal(
+    new URLSearchParams(complete.bytes.toString()).get("files"),
+    JSON.stringify(complete.body.files),
+  );
+});
+
+test("图片准备及发布错误带安全阶段，未知错误值不会进入日志", async (t) => {
+  const h = await setup(t);
+  const { Fault } = await import("../src/http.js");
+  const { reportUploadFailure } = await import("../src/diagnostics.js");
+  for (const [path, stage, action] of [
+    [
+      "/api/files.getUploadURLExternal",
+      "申请上传地址",
+      () => h.slack.prepareUpload(png),
+    ],
+    ["/upload/test", "上传图片字节", () => h.slack.prepareUpload(png)],
+    [
+      "/api/files.completeUploadExternal",
+      "完成图片发布",
+      () => h.slack.publishUpload("fixture-file", "1.000001"),
+    ],
+  ] as const) {
+    h.failures.set(path, { status: 500, count: 1 });
+    await assert.rejects(action, (e: any) => e.stage === stage && e.uncertain);
+  }
+  const logs: string[] = [];
+  reportUploadFailure(
+    new Fault(
+      "正文与签名地址不应泄漏",
+      0,
+      false,
+      "申请上传地址",
+      "invalid_arguments",
+    ),
+    (line) => logs.push(line),
+  );
+  reportUploadFailure(
+    new Fault(
+      "虚构敏感正文",
+      0,
+      false,
+      "完成图片发布",
+      "https://fixture.invalid/private?secret=fixture",
+    ),
+    (line) => logs.push(line),
+  );
+  assert.deepEqual(logs, [
+    "Slack 图片处理失败；阶段：申请上传地址；错误码：invalid_arguments\n",
+    "Slack 图片处理失败；阶段：完成图片发布；错误码：未识别错误\n",
+  ]);
+  assert.equal(
+    reportUploadFailure(new Fault("虚构正文", 0, false, "不可信阶段"), (line) =>
+      logs.push(line),
+    ),
+    "",
+  );
+});
+
+test("单条准备失败恢复保留根及去重，拒绝不确定、已完成、过期和未核实阶段", async (t) => {
+  const h = await setup(t);
+  const { retryFailedSlackImage } = await import("../src/recovery.js");
+  h.bridge.ingest(
+    batch(
+      message("90", [
+        {
+          type: 2,
+          image_item: {
+            media: {
+              encrypt_query_param: "fixture",
+              aes_key: key.toString("base64"),
+            },
+          },
+        },
+      ]),
+    ),
+  );
+  h.failures.set("/api/files.getUploadURLExternal", { status: 400, count: 1 });
+  await h.bridge.work();
+  const job = h.store.get("SELECT * FROM jobs WHERE kind='slackImage'");
+  const root = h.store.get("SELECT root FROM inbound").root;
+  h.store.run("UPDATE jobs SET error='Slack 拒绝请求' WHERE id=?", job.id);
+  await assert.rejects(
+    retryFailedSlackImage(h.c, job.id, root, false),
+    /独立确认/,
+  );
+  for (const status of ["uncertain", "done", "sending", "pending"]) {
+    h.store.run("UPDATE jobs SET status=? WHERE id=?", status, job.id);
+    await assert.rejects(
+      retryFailedSlackImage(h.c, job.id, root, true),
+      /条件不满足/,
+    );
+    assert.equal(
+      h.store.get("SELECT status FROM jobs WHERE id=?", job.id).status,
+      status,
+    );
+  }
+  h.store.run("UPDATE jobs SET status='failed',created=0 WHERE id=?", job.id);
+  await assert.rejects(
+    retryFailedSlackImage(h.c, job.id, root, true),
+    /条件不满足/,
+  );
+  h.store.run("UPDATE jobs SET created=? WHERE id=?", job.created, job.id);
+  await assert.rejects(
+    retryFailedSlackImage(h.c, job.id, "999.000001", true),
+    /条件不满足/,
+  );
+  const before = h.store.all(
+    "SELECT * FROM jobs WHERE id!=? ORDER BY id",
+    job.id,
+  );
+  await retryFailedSlackImage(h.c, job.id, root, true);
+  assert.deepEqual(
+    h.store.all("SELECT * FROM jobs WHERE id!=? ORDER BY id", job.id),
+    before,
+  );
+  await h.bridge.work();
+  assert.equal(
+    h.store.get("SELECT status FROM jobs WHERE id=?", job.id).status,
+    "done",
+  );
+  assert.equal(
+    h.calls.filter(
+      (x) => x.path.endsWith("chat.postMessage") && !x.body.thread_ts,
+    ).length,
+    1,
+  );
+  assert.equal(
+    h.calls.filter((x) => x.path.endsWith("files.completeUploadExternal"))
+      .length,
+    1,
+  );
+  h.bridge.ingest(batch(message("90")));
+  await h.bridge.work();
+  assert.equal(
+    h.calls.filter(
+      (x) => x.path.endsWith("chat.postMessage") && !x.body.thread_ts,
+    ).length,
+    1,
+  );
 });
