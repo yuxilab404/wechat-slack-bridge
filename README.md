@@ -1,2 +1,43 @@
-# wechat-slack-bridge
-TypeScript/Node.js transport bridge between WeChat and Slack, using Slack events to wake an existing assistant. Text and image forwarding are planned; implementation is in progress. No built-in language model.
+# 微信 ↔ Slack 桥
+
+纯 TypeScript/Node 传输程序：微信本人私聊的文字与图片进入 Slack，由用户显式配置的官方 Slack 事件自动化唤醒现有个人 dot；dot 在 Slack 的指定线程回复，再回到原微信消息上下文。桥不调用模型，也不创建另一个代理。
+
+**2026-10-06 已完成真实端到端功能验收。** 已验证文字双向、微信单独图片的识图文字回程，以及 dot 图片回微信；新增生成图片（宇航员猫）也由用户在微信确认收到。匿名结果见 [验收与验证记录](docs/验证记录.md)。
+
+当前仍为 MVP：长期稳定性、连续多轮和并发批处理尚未充分验收，不承诺生产稳定性或即时响应。每条微信消息使用独立 Slack 根线程，回复须遵守原线程、最终标记、身份白名单及上下文有效期；官方事件限频、批处理和重复回复保护仍会影响体验。
+
+## 快速开始
+
+需要 Node ≥22.13（推荐 24）、npm，以及由用户授权的 Slack 应用和微信账号。开发与 CI 不需要这些凭据。
+
+```bash
+npm ci --ignore-scripts
+npm run check
+cp config.example.json config.local.json
+mkdir -m 700 secrets state
+```
+
+修改 `config.local.json` 的虚构身份。通过安全编辑器创建 `secrets/slack.json`，内容字段为 `slackBotToken`、`slackAppToken`，不要把真实值粘进聊天、命令行、README 或 GitHub。设置文件权限 `chmod 600 secrets/slack.json`。然后在用户自己的部署主机交互终端执行：
+
+```bash
+npm run build
+npm run login
+npm start
+```
+
+首次启动默认隔离历史消息。启动后读取状态目录的 `启用确认.txt`，由扫码本人将整行确认口令发给微信机器人；看到“主人已确认启用”后正常聊天。确认口令不是登录凭据，桥也不会将它发到 Slack。启用前的消息不转发，重启无需再次确认。详见 [首次启用与历史隔离](docs/架构.md#首次启用与历史隔离)。
+
+扫码只绑定扫码确认的本人私聊。令牌保存后不需每次输入；过期或撤销后才需重新授权。此处“部署主机”可以是用户选择的云服务器，本项目开发不依赖用户电脑在线。
+
+必须先完成 [Slack 权限与 dot 自动化](docs/Slack配置.md)，否则仅向 Slack 发消息不会自动唤醒 dot。
+
+## 文档
+
+- [架构与投递策略](docs/架构.md)
+- [隐私、安全与配置字段](docs/隐私安全.md)
+- [云开发、部署与 Docker](docs/部署.md)
+- [故障排查及一次性验收](docs/故障排查.md)
+- [匿名真实验收与自动验证记录](docs/验证记录.md)
+- [上游源码、许可和修改](third_party/来源.md)
+
+支持 PNG、JPEG、GIF、WebP 原始文件字节转发；不转码。不支持语音、视频及普通附件。普通回程附件会收到中文说明。每个微信消息创建独立根线程，不会猜测“最近一次”的会话。
